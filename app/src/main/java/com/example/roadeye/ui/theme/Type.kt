@@ -1,4 +1,4 @@
-package com.example.roadeye.ui.theme
+package com.roadeye.app.ui.theme
 
 import androidx.compose.material3.Typography
 import androidx.compose.ui.text.TextStyle

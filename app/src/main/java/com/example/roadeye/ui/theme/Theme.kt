@@ -1,4 +1,4 @@
-package com.example.roadeye.ui.theme
+package com.roadeye.app.ui.theme
 
 import android.app.Activity
 import android.os.Build
