@@ -1,30 +1,79 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:tools="http://schemas.android.com/tools">
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+
+    <!-- Для ограничения детекции по скорости (SpeedProvider.kt) — НЕ
+         блокирует запуск приложения, если пользователь откажет (см.
+         MainActivity, запрашивается best-effort, fail-open дизайн). -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+
+    <!-- Обязательно для Android 14+ (compileSdk/minSdk=36 в этом проекте),
+         т.к. RoadEyeOverlayService — Foreground Service, который теперь
+         непрерывно опрашивает LocationManager. Без этого разрешения ЛИБО
+         объявления "location" в foregroundServiceType ниже — запрос
+         requestLocationUpdates() из foreground-сервиса может упасть с
+         SecurityException на Android 14+, даже если ACCESS_FINE_LOCATION
+         выдано пользователем. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+
+    <uses-feature
+        android:name="android.hardware.camera.any"
+        android:required="true"/>
+
+    <!-- Android 11+ Package Visibility: без этого блока PackageManager
+         не увидит ни один установленный TTS-движок (queryIntentServices
+         вернёт пустой список), даже если движок реально установлен и
+         работает — TextToSpeech не сможет забиндиться, init провалится
+         с status=-1. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE"/>
+        </intent>
+    </queries>
 
     <application
-        android:allowBackup="true"
-        android:dataExtractionRules="@xml/data_extraction_rules"
-        android:fullBackupContent="@xml/backup_rules"
         android:icon="@mipmap/ic_launcher"
-        android:label="@string/app_name"
+        android:label="RoadEye"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
         android:theme="@style/Theme.RoadEye">
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:label="@string/app_name"
-            android:theme="@style/Theme.RoadEye"
-            android:windowSoftInputMode="adjustResize">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
+            android:screenOrientation="fullUser"
+            android:configChanges="orientation|screenSize|smallestScreenSize|keyboardHidden">
 
-                <category android:name="android.intent.category.LAUNCHER" />
+            <intent-filter>
+
+                <action android:name="android.intent.action.MAIN"/>
+
+                <category android:name="android.intent.category.LAUNCHER"/>
+
             </intent-filter>
+
         </activity>
+
+        <!-- Foreground-сервис: владеет камерой и оверлей-окном, живёт
+             независимо от видимости MainActivity — это то, что позволяет
+             RoadEye продолжать распознавание, когда пользователь
+             переключился на навигатор. foregroundServiceType="camera"
+             обязателен на Android 14+ для фонового доступа к камере;
+             "location" добавлен, т.к. сервис теперь также непрерывно
+             опрашивает GPS через SpeedProvider (ограничение детекции по
+             скорости) — без этого типа запрос местоположения из
+             foreground-сервиса может упасть на Android 14+. -->
+        <service
+            android:name=".camera.RoadEyeOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="camera|location"/>
+
     </application>
 
 </manifest>

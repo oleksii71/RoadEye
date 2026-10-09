@@ -1,0 +1,18 @@
+ATTRIBUTION / ИСТОЧНИКИ ДАННЫХ И ЛИЦЕНЗИИ (положить в app/src/main/assets/NOTICE.txt)
+
+1. Russian Traffic Sign Images Dataset (RTSD)
+   V. I. Shakhuro, A. S. Konushin. "Russian traffic sign images dataset". Computer Optics, 2016, 40(2), 294-300.
+   DOI: 10.18287/2412-6179-2016-40-2-294-300
+   Graphics & Media Lab, Lomonosov Moscow State University: https://graphics.cs.msu.ru/projects/traffic-sign-recognition.html
+   Кадры предоставлены компанией Geocentre Consulting (по статье авторов). Явная лицензия на странице проекта не найдена;
+   перед любым не личным/коммерческим использованием получите разрешение у авторов (contact@graphics.cs.msu.ru).
+
+2. Traffic Signs Detection Europe (Roboflow Universe), автор: Radu Oprea, лицензия CC BY 4.0
+   https://universe.roboflow.com/radu-oprea-r4xnm/traffic-signs-detection-europe
+   Изменения: часть классов удалена или объединена, данные переразмечены в общий набор классов.
+
+3. Модель обучена с помощью Ultralytics YOLOv8 (лицензия AGPL-3.0, https://github.com/ultralytics/ultralytics);
+   условия AGPL-3.0 или коммерческой лицензии Ultralytics распространяются на использование и распространение приложения.
+
+Модель дообучена на объединённых данных; точность не гарантируется. Знаки распознаются как вспомогательная информация,
+водитель обязан руководствоваться ПДД и дорожной обстановкой.

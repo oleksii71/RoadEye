@@ -1,4 +1,4 @@
-package com.example.roadeye
+package com.roadeye.app
 
 import org.junit.Test
 
