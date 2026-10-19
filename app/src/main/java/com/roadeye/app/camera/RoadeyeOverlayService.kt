@@ -16,11 +16,13 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.view.Gravity
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewTreeObserver
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
@@ -165,6 +167,14 @@ class RoadEyeOverlayService : Service() {
 
     private lateinit var windowManager: WindowManager
     private var overlayRoot: FrameLayout? = null
+
+    // Тайминги запуска (лог "STARTUP +N ms"): видно, где именно уходит время до первого кадра превью.
+    private val serviceStartMs = SystemClock.elapsedRealtime()
+    private var initScheduled = false
+
+    private fun startupLog(stage: String) {
+        Log.i(TAG, "STARTUP +${SystemClock.elapsedRealtime() - serviceStartMs} ms: $stage")
+    }
     private var frameImageView: ImageView? = null
     private var phraseTextView: TextView? = null
     private var recordButton: RecordButtonView? = null
@@ -241,8 +251,39 @@ class RoadEyeOverlayService : Service() {
         // откладывало бы первую отрисовку окна превью.
         createOverlayWindow()
         phraseTextView?.text = LOADING_TEXT
+        startupLog("окно добавлено")
 
-        mainHandler.post { initCameraAndDashcam() }
+        scheduleInitAfterFirstDraw()
+    }
+
+    /**
+     * Тяжёлая инициализация (DashcamController.start() блокирует главный поток на настройку EGL)
+     * запускается ПОСЛЕ первой отрисовки окна. mainHandler.post() этого не гарантирует: первая
+     * отрисовка идёт по vsync и выполняется позже такого post — окно появлялось только после
+     * инициализации. Страховка: если отрисовки нет, стартуем через 1 с.
+     */
+    private fun scheduleInitAfterFirstDraw() {
+        fun runOnce() {
+            if (initScheduled || isDestroyed) return
+            initScheduled = true
+            initCameraAndDashcam()
+        }
+
+        val root = overlayRoot
+        if (root == null) {
+            mainHandler.post { runOnce() }
+            return
+        }
+
+        root.viewTreeObserver.addOnPreDrawListener(object : ViewTreeObserver.OnPreDrawListener {
+            override fun onPreDraw(): Boolean {
+                root.viewTreeObserver.removeOnPreDrawListener(this)
+                startupLog("первая отрисовка окна")
+                mainHandler.post { runOnce() }
+                return true
+            }
+        })
+        mainHandler.postDelayed({ runOnce() }, 1000L)
     }
 
     /**
@@ -255,19 +296,35 @@ class RoadEyeOverlayService : Service() {
         cameraController = Camera2Controller(this)
         focusCalibrator = FocusCalibrator(cameraController, mainHandler)
 
-        // DASHCAM (Вариант C): создаём и стартуем ДО cameraController.
-        // openCamera() — нужен готовый Surface от компоновщика, чтобы
-        // передать его в Camera2Controller.setVideoSurface() ДО того, как
-        // соберётся CaptureSession (см. комментарий в самом
-        // Camera2Controller.setVideoSurface() — вызов после открытия
-        // камеры ни на что не повлияет без пересоздания сессии).
-        // DashcamController.start() СИНХРОННО ждёт полную настройку EGL —
-        // это реальная блокировка вызывающего потока, не быстрый вызов
-        // (см. комментарий у mainHandler.post() выше, откуда это вызвано).
+        // Превью — НЕЗАВИСИМО от детектора, подключается и запускается
+        // сразу же. Камера открывается немедленно, картинка появляется
+        // в окошке, не дожидаясь загрузки TFLite-модели (~10 сек по
+        // логам — GPU-делегат компилирует шейдеры).
+        cameraController.setPreviewCallback { bitmap ->
+            mainHandler.post {
+                frameImageView?.setImageBitmap(bitmap)
+
+                if (!firstFrameReceived) {
+                    firstFrameReceived = true
+                    startupLog("первый кадр превью")
+                    if (phraseTextView?.text == LOADING_TEXT) {
+                        phraseTextView?.text = ""
+                    }
+                }
+            }
+        }
+
+        cameraController.expectVideoSurface()
+        cameraController.openCamera()
+        startupLog("openCamera() вызван")
+
+        // Камера открывается ПАРАЛЛЕЛЬНО с настройкой EGL у компоновщика записи: открытие идёт на
+        // потоке камеры, а DashcamController.start() блокирует главный поток. Сессия камеры
+        // создаётся, когда готовы оба (см. Camera2Controller.expectVideoSurface()/setVideoSurface()).
         val dashcam = DashcamController(this)
         dashcam.start()
-        cameraController.setVideoSurface(dashcam.videoInputSurface())
         dashcamController = dashcam
+        startupLog("дашкам запущен (EGL готов)")
 
         // Кнопка красится/светлеет ТОЛЬКО по факту реального состояния —
         // идёт ли СЕЙЧАС хоть какая-то запись (удар/тап/кнопка, без
@@ -300,24 +357,10 @@ class RoadEyeOverlayService : Service() {
             (cameraController.currentTotalRotationDegrees() + DashcamConfig.VIDEO_ROTATION_OFFSET_DEGREES) % 360
         }
 
-        // Превью — НЕЗАВИСИМО от детектора, подключается и запускается
-        // сразу же. Камера открывается немедленно, картинка появляется
-        // в окошке, не дожидаясь загрузки TFLite-модели (~10 сек по
-        // логам — GPU-делегат компилирует шейдеры).
-        cameraController.setPreviewCallback { bitmap ->
-            mainHandler.post {
-                frameImageView?.setImageBitmap(bitmap)
-
-                if (!firstFrameReceived) {
-                    firstFrameReceived = true
-                    if (phraseTextView?.text == LOADING_TEXT) {
-                        phraseTextView?.text = ""
-                    }
-                }
-            }
-        }
-
-        cameraController.openCamera()
+        // Видео-Surface отдаём ПОСЛЕДНИМ — когда провайдеры и колбэки уже установлены: как только он
+        // передан, камера создаёт сессию, и кадры сразу идут в компоновщик.
+        cameraController.setVideoSurface(dashcam.videoInputSurface())
+        startupLog("видео-Surface передан камере")
 
         // TrafficSignAnalyzer (TFLite-модель + GPU-шейдеры + TTS) грузится
         // ПАРАЛЛЕЛЬНО, в фоновом потоке — не блокирует ни главный поток,
@@ -343,6 +386,7 @@ class RoadEyeOverlayService : Service() {
         val old = signAnalyzer
         signAnalyzer = null
         cameraController.setFrameAnalyzer(null)
+        cameraController.setDetectionDutyCycle(variant.detectionIdleFactor, variant.minDetectionGapMs)
 
         if (firstFrameReceived) phraseTextView?.text = LOADING_TEXT
         refreshSettingsPanelText()
@@ -729,7 +773,7 @@ class RoadEyeOverlayService : Service() {
                 ModelVariant.values().joinToString("   ") {
                     if (it == currentModelVariant) "[${it.title}]" else it.title
                 } +
-                if (analyzerLoading) "\nзагрузка..." else ""
+                if (analyzerLoading) "\nзагрузка..." else "\nвремя детекции: ${cameraController.lastDetectionDurationMs()} мс"
 
         val overrideEnabled = cameraController.isSpeedGateOverrideEnabled()
         speedGateRow?.text = "Ограничение по скорости (тап — переключить):\n" +

@@ -630,8 +630,14 @@ class DashcamGlCompositor(
         return positions
     }
 
+    // Диагностика записи: сколько кадров реально отрисовано за окно и максимальное время одной отрисовки.
+    private var statWindowStartMs = 0L
+    private var statFrames = 0
+    private var statMaxDrawMs = 0L
+
     private fun drawFrame() {
         if (released) return
+        val drawStartMs = SystemClock.elapsedRealtime()
         try {
             cameraSurfaceTexture.updateTexImage()
 
@@ -652,6 +658,21 @@ class DashcamGlCompositor(
 
             if (!EGL14.eglSwapBuffers(eglDisplay, windowSurface)) {
                 Log.e(TAG, "eglSwapBuffers failed, error=${EGL14.eglGetError()}")
+            }
+
+            val nowMs = SystemClock.elapsedRealtime()
+            if (statWindowStartMs == 0L) statWindowStartMs = nowMs
+            statFrames += 1
+            statMaxDrawMs = maxOf(statMaxDrawMs, nowMs - drawStartMs)
+            if (nowMs - statWindowStartMs >= 5000L) {
+                Log.i(
+                    TAG,
+                    "GL stats: ${"%.1f".format(statFrames * 1000.0 / (nowMs - statWindowStartMs))} fps, " +
+                            "max draw ${statMaxDrawMs} ms (за ${nowMs - statWindowStartMs} мс)"
+                )
+                statWindowStartMs = nowMs
+                statFrames = 0
+                statMaxDrawMs = 0L
             }
         } catch (e: Exception) {
             Log.e(TAG, "drawFrame failed", e)

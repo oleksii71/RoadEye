@@ -65,6 +65,10 @@ class YoloDetector(
     // утекала бы GPU-память.
     private var gpuDelegate: org.tensorflow.lite.gpu.GpuDelegate? = null
 
+    // Буферы лучшего класса/скора на каждый анкор — переиспользуются между кадрами.
+    private var bestScoreBuf = FloatArray(0)
+    private var bestClassBuf = IntArray(0)
+
     private val inputWidth: Int
     private val inputHeight: Int
     private val inputIsQuantized: Boolean
@@ -234,12 +238,18 @@ class YoloDetector(
 
         val inferenceMs = (System.nanoTime() - inferenceStartNs) / 1_000_000.0
 
+        val decodeStartNs = System.nanoTime()
+        val rawDetections = decodeOutput(letterbox, sourceBitmap.width, sourceBitmap.height)
+        val decodeMs = (System.nanoTime() - decodeStartNs) / 1_000_000.0
+
         detectCallCounter++
         if (detectCallCounter % LOG_INFERENCE_TIME_EVERY_N_CALLS == 0) {
-            Log.i(TAG, "Inference time: ${"%.1f".format(inferenceMs)}ms (call #$detectCallCounter)")
+            Log.i(
+                TAG,
+                "Inference time: ${"%.1f".format(inferenceMs)}ms, decode: ${"%.1f".format(decodeMs)}ms, " +
+                        "raw candidates: ${rawDetections.size} (call #$detectCallCounter)"
+            )
         }
-
-        val rawDetections = decodeOutput(letterbox, sourceBitmap.width, sourceBitmap.height)
 
         return nonMaxSuppression(rawDetections)
     }
@@ -307,18 +317,43 @@ class YoloDetector(
             else floatOutputBuffer!![0][feature][anchor]
         }
 
-        for (a in 0 until numAnchors) {
+        // Лучший класс для каждого анкора считаем ПОСЛЕДОВАТЕЛЬНЫМ проходом по строкам
+        // [признак][анкор]. Раньше для каждого анкора читались numClasses разных строк по 8400 float
+        // (кэш-неудобный доступ, при 83 классах заметно дороже). Результат тот же: при равных скорах
+        // побеждает класс с меньшим индексом.
+        if (bestScoreBuf.size != numAnchors) {
+            bestScoreBuf = FloatArray(numAnchors)
+            bestClassBuf = IntArray(numAnchors)
+        }
+        java.util.Arrays.fill(bestScoreBuf, -1f)
+        java.util.Arrays.fill(bestClassBuf, -1)
 
-            var bestClass = -1
-            var bestScore = -1f
-
-            for (c in 0 until numClasses) {
-                val score = value(4 + c, a)
-                if (score > bestScore) {
-                    bestScore = score
-                    bestClass = c
+        for (c in 0 until numClasses) {
+            if (outputIsQuantized) {
+                val row = byteOutputBuffer!![0][4 + c]
+                for (a in 0 until numAnchors) {
+                    val score = dequantizeOutput(row[a])
+                    if (score > bestScoreBuf[a]) {
+                        bestScoreBuf[a] = score
+                        bestClassBuf[a] = c
+                    }
+                }
+            } else {
+                val row = floatOutputBuffer!![0][4 + c]
+                for (a in 0 until numAnchors) {
+                    val score = row[a]
+                    if (score > bestScoreBuf[a]) {
+                        bestScoreBuf[a] = score
+                        bestClassBuf[a] = c
+                    }
                 }
             }
+        }
+
+        for (a in 0 until numAnchors) {
+
+            val bestClass = bestClassBuf[a]
+            val bestScore = bestScoreBuf[a]
 
             if (bestScore < confidenceThreshold || bestClass < 0 || bestClass >= labels.size) continue
 

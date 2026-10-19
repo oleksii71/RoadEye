@@ -12,6 +12,7 @@ import android.hardware.camera2.params.SessionConfiguration
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Log
 import android.view.OrientationEventListener
 import android.view.Surface
@@ -22,6 +23,10 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 private const val TAG = "RoadEyeCamera"
+
+// Сколько ждать видео-Surface от компоновщика записи после открытия камеры, прежде чем запустить
+// превью БЕЗ записи (страховка от зависшей инициализации дашкама).
+private const val VIDEO_SURFACE_WAIT_MS = 3000L
 
 // Целевое разрешение единственного потока с камеры — используется и для
 // ML-анализа, и как источник кадров для плавающего окошка превью.
@@ -75,6 +80,13 @@ class Camera2Controller(
     // только добавляет вторым output в CaptureSession, если он задан.
     private var videoSurface: Surface? = null
 
+    // Ожидание видео-Surface: позволяет открывать камеру ПАРАЛЛЕЛЬНО с настройкой EGL у компоновщика
+    // записи. Сессия камеры создаётся, когда готовы оба: камера открыта И видео-Surface решён.
+    // По умолчанию (expectVideoSurface() не вызывали) ждать не нужно — поведение как раньше.
+    private val videoGateLock = Any()
+    private var videoSurfaceDecided = true
+    private var captureWaitingForVideo = false
+
     @Volatile
     private var frameAnalyzer: FrameAnalyzer? = null
 
@@ -105,6 +117,15 @@ class Camera2Controller(
     // не ждёт освобождения detectionHandler.
     private val analyzerBusy = AtomicBoolean(false)
 
+    // Ограничение "скважности" детекции: после каждого анализа выдерживается пауза не меньше
+    // detectionIdleFactor * (длительность анализа) и не меньше minDetectionGapMs. Нужно, чтобы тяжёлая
+    // модель не занимала CPU/GPU непрерывно и не отнимала ресурсы у превью и записи видео.
+    // idleFactor = 0 и minGap = 0 -> прежнее поведение (только skipInterval + analyzerBusy).
+    @Volatile private var detectionIdleFactor = 0f
+    @Volatile private var minDetectionGapMs = 0L
+    @Volatile private var nextDetectionAllowedAtMs = 0L
+    @Volatile private var lastDetectionDurationMs = 0L
+
     // Поток чтения кадров с камеры (ImageReader-колбэки) + быстрая
     // конвертация превью — должен оставаться лёгким и быстрым.
     private val captureThread = HandlerThread("CameraCaptureThread").apply { start() }
@@ -116,6 +137,13 @@ class Camera2Controller(
     // отсюда дёрганость картинки именно после загрузки детектора.
     private val detectionThread = HandlerThread("DetectionThread").apply { start() }
     private val detectionHandler = Handler(detectionThread.looper)
+
+    // Превью: тяжёлая JPEG-конвертация (десятки мс) вынесена с captureThread. Один capture-запрос
+    // питает И ImageReader анализа, И видео-Surface записи, поэтому медленный колбэк ImageReader
+    // тормозит камеру целиком — дёргаются и превью, и запись. Колбэк должен быстро возвращать кадр.
+    private val previewThread = HandlerThread("PreviewThread").apply { start() }
+    private val previewHandler = Handler(previewThread.looper)
+    private val previewBusy = AtomicBoolean(false)
 
     private val cameraLock = Semaphore(1)
 
@@ -218,7 +246,23 @@ class Camera2Controller(
      * него, это может уронить камеру на уровне фреймворка.
      */
     fun setVideoSurface(surface: Surface?) {
-        videoSurface = surface
+        val startNow = synchronized(videoGateLock) {
+            videoSurface = surface
+            videoSurfaceDecided = true
+            val waiting = captureWaitingForVideo
+            captureWaitingForVideo = false
+            waiting
+        }
+        // Камера уже открыта и ждала Surface — создаём сессию (на потоке камеры, как и раньше).
+        if (startNow) captureHandler.post { startCapture() }
+    }
+
+    /**
+     * Вызвать ДО openCamera(), если видео-Surface будет передан позже через setVideoSurface()
+     * (в том числе null, если записи не будет). Тогда сессия не создаётся, пока Surface не решён.
+     */
+    fun expectVideoSurface() {
+        synchronized(videoGateLock) { videoSurfaceDecided = false }
     }
 
     fun openCamera() {
@@ -283,7 +327,7 @@ class Camera2Controller(
                 ANALYSIS_TARGET_WIDTH,
                 ANALYSIS_TARGET_HEIGHT,
                 android.graphics.ImageFormat.YUV_420_888,
-                /* maxImages = */ 2
+                /* maxImages = */ 3
             ).apply {
                 setOnImageAvailableListener(
                     { reader ->
@@ -312,7 +356,8 @@ class Camera2Controller(
                             val analyzer = frameAnalyzer
                             detectionFrameCounter += 1
                             val skipInterval = loadMonitor.currentSkipInterval()
-                            val detectionDue = detectionFrameCounter % skipInterval == 0L
+                            val detectionDue = detectionFrameCounter % skipInterval == 0L &&
+                                    SystemClock.elapsedRealtime() >= nextDetectionAllowedAtMs
 
                             val speedGateOpen = speedGateOverrideEnabled ||
                                     !speedProvider.hasReliableSpeed() ||
@@ -324,11 +369,17 @@ class Camera2Controller(
                                 val nv21ForDetection = YuvUtils.imageToNv21(image, null)
 
                                 detectionHandler.post {
+                                    val startMs = SystemClock.elapsedRealtime()
                                     try {
                                         analyzer.analyze(nv21ForDetection, width, height, rotation)
                                     } catch (e: Exception) {
                                         Log.e(TAG, "FrameAnalyzer threw an exception", e)
                                     } finally {
+                                        val endMs = SystemClock.elapsedRealtime()
+                                        val durationMs = endMs - startMs
+                                        lastDetectionDurationMs = durationMs
+                                        nextDetectionAllowedAtMs =
+                                            endMs + maxOf(minDetectionGapMs, (durationMs * detectionIdleFactor).toLong())
                                         analyzerBusy.set(false)
                                     }
                                 }
@@ -369,7 +420,36 @@ class Camera2Controller(
 
                         cameraDevice = camera
                         Log.d(TAG, "CameraDevice OPENED gen=$requestGen")
-                        startCapture()
+
+                        val startNow = synchronized(videoGateLock) {
+                            if (videoSurfaceDecided) {
+                                true
+                            } else {
+                                captureWaitingForVideo = true
+                                false
+                            }
+                        }
+
+                        if (startNow) {
+                            startCapture()
+                        } else {
+                            Log.d(TAG, "Camera opened, waiting for video surface before creating session")
+                            captureHandler.postDelayed({
+                                val timedOut = synchronized(videoGateLock) {
+                                    if (captureWaitingForVideo) {
+                                        captureWaitingForVideo = false
+                                        videoSurfaceDecided = true
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                }
+                                if (timedOut) {
+                                    Log.e(TAG, "Video surface not provided in $VIDEO_SURFACE_WAIT_MS ms — starting preview WITHOUT recording")
+                                    startCapture()
+                                }
+                            }, VIDEO_SURFACE_WAIT_MS)
+                        }
                     }
 
                     override fun onDisconnected(camera: CameraDevice) {
@@ -403,11 +483,9 @@ class Camera2Controller(
     }
 
     /**
-     * Лёгкая конвертация кадра в Bitmap для превью — throttled ~24fps,
-     * не зависит от того, подключён ли ML-анализатор. Переиспользуемый
-     * буфер безопасен здесь — превью обрабатывается синхронно, тут же
-     * на captureThread, без передачи на другой поток до создания
-     * итогового Bitmap.
+     * Превью ~24fps. На captureThread делается ТОЛЬКО быстрая копия YUV (NV21) — кадр камеры затем
+     * сразу закрывается вызывающим кодом. JPEG-конвертация, поворот и callback идут на previewThread.
+     * Если предыдущий кадр превью ещё обрабатывается, текущий пропускается.
      */
     private fun maybeUpdatePreview(
         image: android.media.Image,
@@ -420,27 +498,39 @@ class Camera2Controller(
 
         val now = System.currentTimeMillis()
         if (now - lastPreviewAtMs < MIN_PREVIEW_INTERVAL_MS) return
+        if (!previewBusy.compareAndSet(false, true)) return
         lastPreviewAtMs = now
 
-        try {
-            val nv21 = YuvUtils.imageToNv21(image, nv21PreviewBuffer)
-            nv21PreviewBuffer = nv21
-
-            val fullFrameRect = Rect(0, 0, width, height)
-            val rawBitmap = YuvUtils.cropToBitmap(nv21, width, height, fullFrameRect) ?: return
-
-            val bitmap = if (rotationDegrees != 0) {
-                val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-                Bitmap.createBitmap(
-                    rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true
-                )
-            } else {
-                rawBitmap
-            }
-
-            callback(bitmap)
+        val nv21 = try {
+            YuvUtils.imageToNv21(image, nv21PreviewBuffer)
         } catch (e: Exception) {
-            Log.e(TAG, "maybeUpdatePreview failed", e)
+            previewBusy.set(false)
+            Log.e(TAG, "maybeUpdatePreview: NV21 copy failed", e)
+            return
+        }
+        // Буфер не перезапишется, пока previewBusy == true (то есть пока идёт обработка этого кадра).
+        nv21PreviewBuffer = nv21
+
+        previewHandler.post {
+            try {
+                val fullFrameRect = Rect(0, 0, width, height)
+                val rawBitmap = YuvUtils.cropToBitmap(nv21, width, height, fullFrameRect) ?: return@post
+
+                val bitmap = if (rotationDegrees != 0) {
+                    val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                    Bitmap.createBitmap(
+                        rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true
+                    )
+                } else {
+                    rawBitmap
+                }
+
+                callback(bitmap)
+            } catch (e: Exception) {
+                Log.e(TAG, "maybeUpdatePreview failed", e)
+            } finally {
+                previewBusy.set(false)
+            }
         }
     }
 
@@ -541,6 +631,7 @@ class Camera2Controller(
     }
 
     fun closeCamera() {
+        synchronized(videoGateLock) { captureWaitingForVideo = false }
 
         try {
             cameraLock.acquire()
@@ -603,6 +694,16 @@ class Camera2Controller(
      * адаптивного троттлинга, доступны без побочных эффектов.
      */
     fun currentDetectionSkipInterval(): Int = loadMonitor.currentSkipInterval()
+
+    /** Паузы между анализами: см. комментарий у detectionIdleFactor. Вызывается при смене модели. */
+    fun setDetectionDutyCycle(idleFactor: Float, minGapMs: Long) {
+        detectionIdleFactor = idleFactor.coerceAtLeast(0f)
+        minDetectionGapMs = minGapMs.coerceAtLeast(0L)
+        nextDetectionAllowedAtMs = 0L
+    }
+
+    /** Длительность последнего анализа кадра целиком (YUV -> bitmap -> YOLO -> трекинг), мс. */
+    fun lastDetectionDurationMs(): Long = lastDetectionDurationMs
     fun currentThermalStatus(): Int = loadMonitor.currentThermalStatus()
 
     fun currentSpeedKmh(): Float = speedProvider.currentSpeedKmh()
@@ -670,6 +771,7 @@ class Camera2Controller(
         speedProvider.release()
         captureThread.quitSafely()
         detectionThread.quitSafely()
+        previewThread.quitSafely()
         Log.d(TAG, "Camera threads released")
     }
 }
