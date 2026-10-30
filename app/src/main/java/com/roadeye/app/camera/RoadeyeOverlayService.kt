@@ -8,7 +8,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.res.Configuration
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Build
@@ -27,6 +26,7 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.roadeye.app.MainActivity
@@ -40,6 +40,7 @@ private const val TAG = "RoadEyeOverlay"
 private const val NOTIFICATION_CHANNEL_ID = "roadeye_camera_service"
 private const val NOTIFICATION_ID = 1
 private const val LOADING_TEXT = "Загрузка..."
+private const val FOCUS_CALIBRATION_IDLE_TEXT = "Калибровка фокуса (тап — запустить)"
 
 // Раньше onDetection просто перезаписывал phraseTextView последней
 // детекцией за кадр — при нескольких РАЗНЫХ знаках подряд видна была
@@ -198,6 +199,10 @@ class RoadEyeOverlayService : Service() {
     private var enlargeButton: TextView? = null
     private var speedGateRow: TextView? = null
     private var statsTextView: TextView? = null
+    private var focusRow: TextView? = null
+    private var focusResultsContainer: LinearLayout? = null
+    private var focusResultRows: List<Pair<TextView, FocusCalibrator.CandidateResult>> = emptyList()
+    private var focusBestResult: FocusCalibrator.CandidateResult? = null
     private var isSettingsPanelVisible = false
 
     // Увеличенный режим — окно временно занимает почти весь экран вместо
@@ -231,6 +236,9 @@ class RoadEyeOverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         Log.d(TAG, "Service onCreate")
+
+        // Настройки нужны панели сразу, до создания Camera2Controller.
+        CameraSettings.init(this)
 
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
 
@@ -686,12 +694,24 @@ class RoadEyeOverlayService : Service() {
         }
 
         val focusCalibrationRowView = TextView(this).apply {
-            text = "Калибровка фокуса (тап — запустить)"
+            text = FOCUS_CALIBRATION_IDLE_TEXT
             setTextColor(Color.WHITE)
             textSize = 13f
             setPadding(0, (12 * resources.displayMetrics.density).toInt(), 0, 0)
             isClickable = true
             setOnClickListener { toggleFocusCalibration(this) }
+        }
+
+        val focusResultsView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+        }
+
+        val focusRowView = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(0, 0, 0, (8 * resources.displayMetrics.density).toInt())
+            isClickable = true
+            setOnClickListener { cycleFocus() }
         }
 
         val settingsPanelView = LinearLayout(this).apply {
@@ -710,10 +730,17 @@ class RoadEyeOverlayService : Service() {
             ).apply {
                 gravity = Gravity.CENTER
             }
-            addView(modelRowView)
-            addView(speedGateRowView)
-            addView(statsTextViewInner)
-            addView(focusCalibrationRowView)
+            // Строк стало много, а окно маленькое — прокрутка вместо обрезания внизу.
+            val rowsContainer = LinearLayout(this@RoadEyeOverlayService).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(modelRowView)
+                addView(speedGateRowView)
+                addView(focusRowView)
+                addView(statsTextViewInner)
+                addView(focusCalibrationRowView)
+                addView(focusResultsView)
+            }
+            addView(ScrollView(this@RoadEyeOverlayService).apply { addView(rowsContainer) })
         }
 
         root.addView(imageView)
@@ -746,6 +773,8 @@ class RoadEyeOverlayService : Service() {
         speedGateRow = speedGateRowView
         modelRow = modelRowView
         statsTextView = statsTextViewInner
+        focusRow = focusRowView
+        focusResultsContainer = focusResultsView
         enlargeButton = enlargeButtonView
         recordButton = recordButtonView
     }
@@ -791,6 +820,23 @@ class RoadEyeOverlayService : Service() {
         statsTextView?.text = "Частота детекции: каждый $skipInterval-й кадр\n" +
                 "Температура: $thermalText\n" +
                 "Скорость: $speedText"
+
+        refreshFocusRow()
+    }
+
+    private fun refreshFocusRow() {
+        val index = CameraSettings.focusIndex()
+        focusRow?.text = "Фокус (тап — сменить):\n" +
+                CameraSettings.FOCUS_OPTIONS.mapIndexed { i, option ->
+                    if (i == index) "[${option.label}]" else option.label
+                }.joinToString("   ")
+    }
+
+    private fun cycleFocus() {
+        CameraSettings.setFocusIndex((CameraSettings.focusIndex() + 1) % CameraSettings.FOCUS_OPTIONS.size)
+        cameraController.restoreConfiguredFocusDistance()
+        refreshFocusRow()
+        renderFocusResults()
     }
 
     private fun thermalStatusText(status: Int): String = when (status) {
@@ -805,13 +851,10 @@ class RoadEyeOverlayService : Service() {
     }
 
     /**
-     * Запускает/останавливает ассистированную калибровку фокуса (см.
-     * FocusCalibrator.kt). Пользователь должен физически стоять на
-     * фиксированной дистанции (например, 50м) от ОДНОГО знака и держать
-     * его в кадре, пока идёт перебор — калибровка сама меняет фокус и
-     * слушает сырые детекции, но НЕ проверяет, что в кадре именно нужный
-     * знак. Результат НЕ применяется автоматически — пользователь сам
-     * переносит лучшее значение в CameraConfig.FIXED_FOCUS_DISTANCE.
+     * Запускает/останавливает проверку трёх позиций фокуса (см. FocusCalibrator.kt).
+     * Пользователь должен держать в кадре ОДИН знак на известной дистанции, пока идёт перебор
+     * (~8 секунд). Результат не применяется автоматически — выбор делается тапом по строке
+     * результата и сохраняется в CameraSettings (переживает перезапуск).
      */
     private fun toggleFocusCalibration(rowView: TextView) {
 
@@ -819,45 +862,78 @@ class RoadEyeOverlayService : Service() {
 
         if (calibrator.isCalibrating()) {
             calibrator.cancel()
-            rowView.text = "Калибровка фокуса (тап — запустить)"
+            rowView.text = FOCUS_CALIBRATION_IDLE_TEXT
             return
         }
 
-        // Шаг 0.02 от 0.0 (бесконечность) до 0.24 (~4м) — плотнее, чем
-        // ручной bracket из комментария CameraConfig.kt, т.к. перебор
-        // теперь автоматический и не требует пересборки APK на каждое
-        // значение.
-        val candidates = (0..12).map { it * 0.02f }
-
+        focusResultsContainer?.removeAllViews()
+        focusResultRows = emptyList()
+        focusBestResult = null
         rowView.text = "Калибровка: подготовка..."
 
         calibrator.start(
-            candidates = candidates,
             onProgress = { progress -> rowView.text = "Калибровка: $progress" },
-            onComplete = { results ->
-                val sorted = results.sortedByDescending { it.bestConfidence }
-                val best = sorted.firstOrNull()
-
-                val summary = buildString {
-                    if (best == null || best.bestConfidence == 0f) {
-                        append("Ни одно значение не дало детекций.\n")
-                        append("Знак в кадре? Дистанция похожа на рабочую?")
-                    } else {
-                        append("Лучшее: ${best.focusDistance} ")
-                        append("(${(best.bestConfidence * 100).toInt()}%, ")
-                        append("${best.detectionCount} детекций)\n")
-                        append("Перенесите это значение в CameraConfig.FIXED_FOCUS_DISTANCE вручную.\n\n")
-                        append("Топ-3:\n")
-                        sorted.take(3).forEach {
-                            append("${it.focusDistance} — ${(it.bestConfidence * 100).toInt()}%\n")
-                        }
-                    }
-                }
-
-                rowView.text = summary
-                Log.i(TAG, "Focus calibration complete: $summary")
-            }
+            onComplete = { results -> showFocusCalibrationResults(rowView, results) }
         )
+    }
+
+    private fun showFocusCalibrationResults(
+        rowView: TextView,
+        results: List<FocusCalibrator.CandidateResult>
+    ) {
+        val container = focusResultsContainer ?: return
+        container.removeAllViews()
+
+        // Лучшая позиция — по confidence, при равенстве по числу детекций; только если были детекции.
+        val best = results
+            .filter { it.bestConfidence > 0f }
+            .maxWithOrNull(compareBy<FocusCalibrator.CandidateResult>({ it.bestConfidence }, { it.detectionCount }))
+        focusBestResult = best
+
+        rowView.text = if (best == null) {
+            "Ни одна позиция не дала детекций. Знак в кадре? Дистанция рабочая?\n" +
+                    "(тап — запустить заново)"
+        } else {
+            "Результат — тап по позиции, чтобы выбрать и сохранить\n(тап здесь — запустить заново):"
+        }
+
+        val rows = results.map { result ->
+            val row = TextView(this).apply {
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                setPadding(0, (6 * resources.displayMetrics.density).toInt(), 0, 0)
+                isClickable = true
+                setOnClickListener {
+                    CameraSettings.setFocusIndex(result.optionIndex)
+                    cameraController.restoreConfiguredFocusDistance()
+                    refreshFocusRow()
+                    renderFocusResults()
+                }
+            }
+            container.addView(row)
+            row to result
+        }
+        focusResultRows = rows
+        renderFocusResults()
+
+        Log.i(
+            TAG,
+            "Focus calibration complete: " +
+                    results.joinToString { "${it.label}=${(it.bestConfidence * 100).toInt()}%/${it.detectionCount}" } +
+                    ", recommended=${best?.label ?: "none"}"
+        )
+    }
+
+    /** Перерисовывает строки результата: ● — выбранная и сохранённая позиция, ★ — рекомендованная. */
+    private fun renderFocusResults() {
+        val selected = CameraSettings.focusIndex()
+        val best = focusBestResult
+        focusResultRows.forEach { (row, result) ->
+            val mark = if (result.optionIndex == selected) "●" else "○"
+            val star = if (best != null && result.optionIndex == best.optionIndex) "  ★ рекомендовано" else ""
+            row.text = "$mark ${result.label} — ${(result.bestConfidence * 100).toInt()}% " +
+                    "(${result.detectionCount} дет.)$star"
+        }
     }
 
     /**

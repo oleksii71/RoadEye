@@ -1,0 +1,9 @@
+﻿--------- beginning of main
+10-20 14:12:30.544  4266  6211 I RoadEyeDashcam: GL stats: 27,1 fps, max draw 139 ms (╨╖╨░ 5024 ╨╝╤Б)
+10-20 14:12:35.570  4266  6211 I RoadEyeDashcam: GL stats: 21,1 fps, max draw 128 ms (╨╖╨░ 5026 ╨╝╤Б)
+10-20 14:12:38.267  4266  4266 D RoadEyeOverlay: Power button tapped тАФ stopping service
+10-20 14:12:38.271  4266  4266 D RoadEyeOverlay: Service onDestroy
+10-20 14:12:39.408  4266  4266 D RoadEyeCamera: Camera close requested, waiting for onClosed callback...
+10-20 14:12:39.409  4266  6193 D RoadEyeCamera: CameraDevice fully closed
+10-20 14:12:39.409  4266  4266 D RoadEyeCamera: Camera close completed
+10-20 14:12:39.411  4266  4266 D RoadEyeCamera: Camera threads released

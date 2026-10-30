@@ -17,6 +17,7 @@ import android.util.Log
 import android.view.OrientationEventListener
 import android.view.Surface
 import androidx.core.content.ContextCompat
+import com.roadeye.app.dashcam.DashcamConfig
 import java.util.concurrent.Executor
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -61,6 +62,32 @@ class Camera2Controller(
 
     private val cameraManager =
         context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+
+    init {
+        CameraSettings.init(context)
+    }
+
+    private val cameraChars: CameraCharacteristics? by lazy {
+        try {
+            cameraManager.getCameraCharacteristics(CameraConfig.CAMERA_ID)
+        } catch (e: Exception) {
+            Log.e(TAG, "getCameraCharacteristics failed", e)
+            null
+        }
+    }
+
+    /**
+     * Диапазон кадров для AE: из поддерживаемых камерой берём тот, где верхняя граница = 30 fps,
+     * с максимальной нижней границей (лучше всего [30,30]). Без этого AE в тусклом свете сам
+     * снижает частоту до 15-24 fps удлинением выдержки, и видео идёт рывками.
+     * Компромисс: выдержка AE не длиннее ~1/30 с, в темноте кадр темнее.
+     */
+    private val targetFpsRange: android.util.Range<Int>? by lazy {
+        cameraChars
+            ?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.filter { it.upper == DashcamConfig.VIDEO_FRAME_RATE }
+            ?.maxByOrNull { it.lower }
+    }
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
@@ -549,26 +576,15 @@ class Camera2Controller(
         requestBuilder.addTarget(analysisSurface)
         video?.let { requestBuilder.addTarget(it) }
 
-        if (CameraConfig.AUTO_FOCUS) {
-            requestBuilder.set(
-                CaptureRequest.CONTROL_AF_MODE,
-                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
-            )
-        } else {
-            requestBuilder.set(
-                CaptureRequest.CONTROL_AF_MODE,
-                CaptureRequest.CONTROL_AF_MODE_OFF
-            )
-            requestBuilder.set(
-                CaptureRequest.LENS_FOCUS_DISTANCE,
-                CameraConfig.FIXED_FOCUS_DISTANCE
-            )
-        }
+        applyFocusToBuilder(requestBuilder)
 
         requestBuilder.set(
             CaptureRequest.CONTROL_AE_MODE,
             CaptureRequest.CONTROL_AE_MODE_ON
         )
+        targetFpsRange?.let {
+            requestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it)
+        }
 
         requestBuilder.set(
             CaptureRequest.CONTROL_AWB_MODE,
@@ -736,15 +752,13 @@ class Camera2Controller(
 
     /**
      * Меняет фокус "на лету", БЕЗ пересоздания сессии/камеры — нужно
-     * только для калибровки фокуса (см. FocusCalibrator.kt). Принудительно
+     * для калибровки фокуса (см. FocusCalibrator.kt). Принудительно
      * переводит объектив в ручной режим (CONTROL_AF_MODE_OFF), даже если
      * CameraConfig.AUTO_FOCUS=true — калибровка бессмысленна при активном
      * автофокусе, который сам решает, куда фокусироваться.
      *
-     * ВАЖНО: это НЕ меняет CameraConfig.FIXED_FOCUS_DISTANCE и не
-     * сохраняется между запусками — временное значение для теста.
-     * Финальное значение пользователь переносит в CameraConfig.kt вручную
-     * по результатам калибровки (сознательное решение — см. обсуждение).
+     * ВАЖНО: значение временное и в настройках НЕ сохраняется. Постоянный выбор
+     * хранится в CameraSettings, вернуться к нему — restoreConfiguredFocusDistance().
      */
     fun setManualFocusDistance(distance: Float) {
         val builder = activeRequestBuilder ?: return
@@ -758,10 +772,29 @@ class Camera2Controller(
         }
     }
 
-    /** Возвращает фокус к значению из CameraConfig — вызывать по окончании калибровки. */
+    /** Возвращает фокус к сохранённому в настройках значению (∞ / 25 м / 50 м). */
     fun restoreConfiguredFocusDistance() {
         if (!CameraConfig.AUTO_FOCUS) {
-            setManualFocusDistance(CameraConfig.FIXED_FOCUS_DISTANCE)
+            setManualFocusDistance(currentFocusDiopters())
+        }
+    }
+
+    private fun currentFocusDiopters(): Float {
+        val wanted = CameraSettings.FOCUS_OPTIONS[CameraSettings.focusIndex()].diopters
+        // LENS_INFO_MINIMUM_FOCUS_DISTANCE — максимум в диоптриях; 0 = фиксированный фокус.
+        val maxDiopters = cameraChars?.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+        return if (maxDiopters != null && maxDiopters > 0f) wanted.coerceAtMost(maxDiopters) else wanted
+    }
+
+    private fun applyFocusToBuilder(builder: CaptureRequest.Builder) {
+        if (CameraConfig.AUTO_FOCUS) {
+            builder.set(
+                CaptureRequest.CONTROL_AF_MODE,
+                CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+            )
+        } else {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, currentFocusDiopters())
         }
     }
 
